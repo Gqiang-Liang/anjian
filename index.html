@@ -957,9 +957,10 @@ function downloadFrames() {
 
 // ===== Step 4: 视频合成 =====
 function renderStep4(el) {
+  const hasAudioFile = generatedAudio && generatedAudio.blob;
   el.innerHTML = `
     <div class="stage-panel">
-      <h3>🎬 FFmpeg 合成视频</h3>
+      <h3>🎬 合成视频</h3>
       <p class="text-sm mb-12">将配音 + 画面合成为一个MP4视频文件</p>
       
       <div class="card">
@@ -972,7 +973,21 @@ function renderStep4(el) {
         </div>
       </div>
 
-      <div id="ffmpegCheck"></div>
+      <div class="card">
+        <h4>🎞️ 合成方式</h4>
+        <div id="composeMode">
+          ${hasAudioFile ? `
+          <label style="display:flex;align-items:center;gap:6px;padding:10px 16px;background:var(--bg);border-radius:8px;border:1px solid var(--border);cursor:pointer;margin-bottom:8px">
+            <input type="radio" name="composeMode" value="canvas" checked> Canvas录制（多浏览器兼容 ✅）
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;padding:10px 16px;background:var(--bg);border-radius:8px;border:1px solid var(--border);cursor:pointer">
+            <input type="radio" name="composeMode" value="ffmpeg"> FFmpeg.wasm（需COOP/COEP头）
+          </label>` : `
+          <label style="display:flex;align-items:center;gap:6px;padding:10px 16px;background:var(--bg);border-radius:8px;border:1px solid var(--border);cursor:pointer">
+            <input type="radio" name="composeMode" value="screencap" checked> 屏幕录制（需选择分享标签页+音频）
+          </label>`}
+        </div>
+      </div>
 
       <div class="flex gap-8 wrap">
         <button class="btn btn-primary" onclick="composeVideo()">🎬 合成视频</button>
@@ -981,7 +996,7 @@ function renderStep4(el) {
       
       <div class="progress-wrap hidden" id="ffmpegProgress">
         <div class="progress-bar"><div class="progress-fill" id="ffmpegFill"></div></div>
-        <div class="progress-text" id="ffmpegText">加载FFmpeg...</div>
+        <div class="progress-text" id="ffmpegText">准备中...</div>
       </div>
       <div class="log-box" id="ffmpegLog"><div class="info">等待操作...</div></div>
       
@@ -996,7 +1011,6 @@ function renderStep4(el) {
         </div>
       </div>
     </div>`;
-    
   updateMaterialStatus();
 }
 
@@ -1026,131 +1040,254 @@ function addFFmpegLog(msg, cls='info') {
 let finalVideoBlob = null;
 
 async function composeVideo() {
+  const mode = document.querySelector('input[name="composeMode"]')?.value || 'canvas';
+  
+  if (mode === 'canvas') await composeWithCanvas();
+  else if (mode === 'ffmpeg') await composeWithFFmpeg();
+  else if (mode === 'screencap') await composeWithScreenCap();
+}
+
+// ===== 方式1: Canvas录制（兼容性最好，GitHub Pages可用） =====
+async function composeWithCanvas() {
+  const el = document.getElementById('ffmpegProgress');
+  const log = document.getElementById('ffmpegLog');
+  el.classList.remove('hidden');
+  document.getElementById('videoResult').classList.add('hidden');
+  log.innerHTML = '';
+  
+  function l(msg, c='info') { log.innerHTML += `<div class="${c}">${msg}</div>`; }
+
+  if (!generatedAudio || !generatedAudio.blob) { l('❌ 没有配音文件', 'err'); return; }
+  if (generatedFrames.length === 0) { l('❌ 没有画面文件', 'err'); return; }
+
+  const c = getCurrentCase();
+  l('🔄 初始化Canvas录制器...');
+  document.getElementById('ffmpegText').textContent = '初始化...';
+
+  try {
+    // 创建离屏Canvas
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = 540; offCanvas.height = 960;
+    const offCtx = offCanvas.getContext('2d');
+    
+    // 加载所有帧为Image对象
+    const images = [];
+    for (let i = 0; i < generatedFrames.length; i++) {
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = generatedFrames[i].url;
+      });
+      images.push(img);
+      l(`📷 场景${i+1}: 图片已加载`);
+    }
+    
+    // 设置音频上下文
+    const audioCtx = new AudioContext();
+    const dest = audioCtx.createMediaStreamDestination();
+    
+    // 加载音频
+    const audioData = await generatedAudio.blob.arrayBuffer();
+    const audioBuffer = await audioCtx.decodeAudioData(audioData);
+    const source = audioCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(dest);
+    
+    // 同步背景音乐
+    const bgm = audioCtx.createOscillator();
+    const bgmGain = audioCtx.createGain();
+    bgmGain.gain.value = 0.015;
+    bgm.type = 'sine';
+    bgm.frequency.value = 180;
+    bgm.connect(bgmGain);
+    bgmGain.connect(dest);
+    bgm.start();
+    
+    // 视频流
+    const videoStream = offCanvas.captureStream(30);
+    const combined = new MediaStream([
+      ...videoStream.getVideoTracks(),
+      ...dest.stream.getAudioTracks()
+    ]);
+    
+    // 开始录制
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+      ? 'video/webm;codecs=vp9' : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+      ? 'video/webm;codecs=vp8' : 'video/webm';
+    
+    const recorder = new MediaRecorder(combined, { mimeType });
+    const chunks = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    
+    const totalDuration = audioBuffer.duration;
+    l(`🎬 开始录制 (${Math.ceil(totalDuration)}秒, ${mimeType})`, 'ok');
+    document.getElementById('ffmpegText').textContent = '录制中...';
+    
+    // 计算每个场景的时间分配
+    const totalSceneDur = c.scenes.reduce((s, x) => s + x.dur, 0);
+    
+    recorder.start(100);
+    source.start();
+    
+    const startTime = Date.now();
+    let prevScene = -1;
+    
+    function renderFrame() {
+      const elapsed = (Date.now() - startTime) / 1000;
+      const pct = Math.min(elapsed / totalDuration * 100, 100);
+      document.getElementById('ffmpegFill').style.width = pct + '%';
+      document.getElementById('ffmpegText').textContent = `录制中 ${Math.floor(pct)}% (${Math.ceil(elapsed)}/${Math.ceil(totalDuration)}秒)`;
+      
+      // 计算当前场景
+      let acc = 0;
+      let curScene = c.scenes.length - 1;
+      for (let i = 0; i < c.scenes.length; i++) {
+        const sceneDur = (c.scenes[i].dur / totalSceneDur) * totalDuration;
+        acc += sceneDur;
+        if (elapsed < acc) { curScene = i; break; }
+      }
+      
+      if (curScene !== prevScene) {
+        prevScene = curScene;
+        if (images[curScene]) {
+          offCtx.drawImage(images[curScene], 0, 0, 540, 960);
+        }
+      }
+      
+      if (elapsed >= totalDuration + 0.5) {
+        recorder.stop();
+        bgm.stop();
+        l('⏳ 合成完成...', 'ok');
+        return;
+      }
+      requestAnimationFrame(renderFrame);
+    }
+    
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      finalVideoBlob = blob;
+      
+      document.getElementById('ffmpegFill').style.width = '100%';
+      document.getElementById('ffmpegText').textContent = `✅ 已完成！${(blob.size/1024/1024).toFixed(1)}MB`;
+      
+      document.getElementById('videoResult').classList.remove('hidden');
+      document.getElementById('finalVideo').src = url;
+      document.getElementById('videoInfo').textContent = `${(blob.size/1024/1024).toFixed(1)}MB | WebM`;
+      l(`✅ 视频已生成！${(blob.size/1024/1024).toFixed(1)}MB`, 'ok');
+    };
+    
+    renderFrame();
+    
+  } catch(e) {
+    l('❌ Canvas录制失败: ' + e.message, 'err');
+    l('💡 尝试使用「屏幕录制」方式', 'info');
+    document.getElementById('ffmpegText').textContent = '❌ 失败，试试屏幕录制';
+  }
+}
+
+// ===== 方式2: FFmpeg.wasm =====
+async function composeWithFFmpeg() {
   document.getElementById('ffmpegProgress').classList.remove('hidden');
   document.getElementById('videoResult').classList.add('hidden');
   document.getElementById('ffmpegLog').innerHTML = '';
   
-  // 检查素材
-  if (!generatedAudio || !generatedAudio.blob) {
-    addFFmpegLog('❌ 没有配音文件，请先生成配音（建议用OpenAI TTS或跳过）', 'err');
-    document.getElementById('ffmpegFill').style.width = '0%';
-    return;
-  }
-  if (generatedFrames.length === 0) {
-    addFFmpegLog('❌ 没有画面文件，请先生成画面', 'err');
-    return;
-  }
+  function l(msg, c='info') { addFFmpegLog(msg, c); }
 
-  addFFmpegLog('🔄 正在加载FFmpeg.wasm...');
+  if (!generatedAudio || !generatedAudio.blob) { l('❌ 没有配音文件', 'err'); return; }
+  if (generatedFrames.length === 0) { l('❌ 没有画面文件', 'err'); return; }
+
+  l('🔄 正在加载FFmpeg.wasm...');
   document.getElementById('ffmpegText').textContent = '加载FFmpeg...';
   
   try {
     const { FFmpeg } = await import('@ffmpeg/ffmpeg');
     const { toBlobURL } = await import('@ffmpeg/util');
-    
     const ffmpeg = new FFmpeg();
     
-    ffmpeg.on('progress', ({ progress, time }) => {
-      const pct = Math.min(progress * 100, 99);
-      document.getElementById('ffmpegFill').style.width = pct + '%';
-      document.getElementById('ffmpegText').textContent = `合成中 ${Math.floor(pct)}%`;
+    ffmpeg.on('progress', ({ progress }) => {
+      document.getElementById('ffmpegFill').style.width = Math.min(progress * 100, 99) + '%';
+      document.getElementById('ffmpegText').textContent = `合成中 ${Math.floor(progress * 100)}%`;
+    });
+    ffmpeg.on('log', ({ message }) => { 
+      if (message.includes('Error')) l('⚠️ ' + message, 'err'); 
     });
 
-    ffmpeg.on('log', ({ message }) => {
-      if (message.includes('Error') || message.includes('error')) {
-        addFFmpegLog('⚠️ ' + message, 'err');
-      }
-    });
-
-    // 加载 FFmpeg
     const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
     await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      coreURL: await toBlobURL(baseURL + '/ffmpeg-core.js', 'text/javascript'),
+      wasmURL: await toBlobURL(baseURL + '/ffmpeg-core.wasm', 'application/wasm'),
     });
-    
-    addFFmpegLog('✅ FFmpeg 加载完成', 'ok');
-    document.getElementById('ffmpegText').textContent = '写入素材文件...';
+    l('✅ FFmpeg 加载完成', 'ok');
 
-    // 写入音频文件
+    // 写入音频
     const audioData = new Uint8Array(await generatedAudio.blob.arrayBuffer());
     await ffmpeg.writeFile('audio.mp3', audioData);
-    addFFmpegLog(`✅ 音频已写入 (${(audioData.length/1024).toFixed(0)}KB)`, 'ok');
+    l(`✅ 音频已写入 (${(audioData.length/1024).toFixed(0)}KB)`, 'ok');
 
-    // 写入每一帧图片
+    // 写入帧
     const c = getCurrentCase();
     for (let i = 0; i < generatedFrames.length; i++) {
-      const f = generatedFrames[i];
-      const imgData = new Uint8Array(await f.blob.arrayBuffer());
-      const filename = `frame_${String(i).padStart(3,'0')}.png`;
-      await ffmpeg.writeFile(filename, imgData);
-      // 对于不同时长，我们复制成多帧
-      const dur = c.scenes[i]?.dur || 5;
-      // 复制帧数 = dur (假设1fps = 1帧=1秒)
-      // 实际上我们创建每帧1秒的片段
-      addFFmpegLog(`📝 场景${i+1}: ${filename} (${dur}秒)`, 'info');
+      const imgData = new Uint8Array(await generatedFrames[i].blob.arrayBuffer());
+      await ffmpeg.writeFile(`frame_${String(i).padStart(3,'0')}.png`, imgData);
     }
-    addFFmpegLog(`✅ ${generatedFrames.length} 帧已写入`, 'ok');
+    l(`✅ ${generatedFrames.length} 帧已写入`, 'ok');
 
-    document.getElementById('ffmpegText').textContent = '合成视频中...';
-
-    // 构建 concat 描述文件
-    let concatContent = 'ffconcat version 1.0\n';
+    // concat
+    let cc = 'ffconcat version 1.0\n';
     for (let i = 0; i < generatedFrames.length; i++) {
-      const dur = (c.scenes[i]?.dur || 5);
-      concatContent += `file frame_${String(i).padStart(3,'0')}.png\nduration ${dur}\n`;
+      cc += `file frame_${String(i).padStart(3,'0')}.png\nduration ${c.scenes[i]?.dur || 5}\n`;
     }
-    // 最后一帧需要再重复一次（ffmpeg concat需要）
-    const lastIdx = generatedFrames.length - 1;
-    concatContent += `file frame_${String(lastIdx).padStart(3,'0')}.png\n`;
+    cc += `file frame_${String(generatedFrames.length - 1).padStart(3,'0')}.png\n`;
+    await ffmpeg.writeFile('concat.txt', cc);
 
-    await ffmpeg.writeFile('concat.txt', concatContent);
-    addFFmpegLog('📝 concat.txt 已写入', 'ok');
-
-    // 执行FFmpeg合成
-    addFFmpegLog('🎬 正在运行FFmpeg合成...');
-    document.getElementById('ffmpegText').textContent = '合成中...';
+    l('🎬 运行FFmpeg合成...');
+    await ffmpeg.exec(['-f','concat','-safe','0','-i','concat.txt','-i','audio.mp3',
+      '-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac','-shortest','-movflags','+faststart','output.mp4']);
     
-    await ffmpeg.exec([
-      '-f', 'concat',
-      '-safe', '0',
-      '-i', 'concat.txt',
-      '-i', 'audio.mp3',
-      '-c:v', 'libx264',
-      '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac',
-      '-shortest',
-      '-movflags', '+faststart',
-      'output.mp4'
-    ]);
-
-    addFFmpegLog('🎬 合成完成！', 'ok');
-    document.getElementById('ffmpegFill').style.width = '100%';
-    document.getElementById('ffmpegText').textContent = '✅ 合成完成！';
-    
-    // 读取输出文件
     const data = await ffmpeg.readFile('output.mp4');
     const blob = new Blob([data.buffer], { type: 'video/mp4' });
-    const url = URL.createObjectURL(blob);
     finalVideoBlob = blob;
     
-    // 显示结果
+    document.getElementById('ffmpegFill').style.width = '100%';
+    document.getElementById('ffmpegText').textContent = '✅ 合成完成！';
     document.getElementById('videoResult').classList.remove('hidden');
-    const video = document.getElementById('finalVideo');
-    video.src = url;
+    document.getElementById('finalVideo').src = URL.createObjectURL(blob);
     document.getElementById('videoInfo').textContent = `${(blob.size/1024/1024).toFixed(1)}MB | MP4`;
-
-    addFFmpegLog(`✅ 视频已生成！${(blob.size/1024/1024).toFixed(1)}MB`, 'ok');
-    
-    // 清理
+    l(`✅ 视频已生成！${(blob.size/1024/1024).toFixed(1)}MB`, 'ok');
     ffmpeg.terminate();
 
   } catch(e) {
-    addFFmpegLog('❌ 错误：' + e.message, 'err');
-    console.error(e);
-    document.getElementById('ffmpegText').textContent = '❌ 合成失败';
+    l('❌ FFmpeg失败: ' + e.message, 'err');
+    l('💡 切换到「Canvas录制」模式试试', 'info');
+    document.getElementById('ffmpegText').textContent = '❌ FFmpeg不可用，请切到Canvas模式';
   }
 }
+
+// ===== 方式3: 屏幕录制（Web Speech备用） =====
+async function composeWithScreenCap() {
+  document.getElementById('ffmpegProgress').classList.remove('hidden');
+  document.getElementById('videoResult').classList.add('hidden');
+  document.getElementById('ffmpegLog').innerHTML = '';
+  
+  function l(msg, c='info') { addFFmpegLog(msg, c); }
+  
+  const c = getCurrentCase();
+  if (generatedFrames.length === 0) { l('❌ 没有画面文件', 'err'); return; }
+  
+  l('🔄 请求屏幕共享...');
+  document.getElementById('ffmpegText').textContent = '请求屏幕共享...';
+  
+  try {
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: 540, height: 960 },
+      audio: { echoCancellation: false, noiseSuppression: false }
+    });
+    
+    const audioTracks = displayStream.getAudioTracks();
+    l(`✅ 已获取: 视频1 + 音频${audioTracks.length}`, 'ok');
+    if (audioTracks.length === 0) l('⚠️ 确保勾选
 
 function downloadVideo() {
   if (!finalVideoBlob) return toast('请先生成视频');
