@@ -1267,29 +1267,79 @@ async function composeWithFFmpeg() {
 
 // ===== 方式3: 屏幕录制（Web Speech备用） =====
 async function composeWithScreenCap() {
-  document.getElementById('ffmpegProgress').classList.remove('hidden');
-  document.getElementById('videoResult').classList.add('hidden');
-  document.getElementById('ffmpegLog').innerHTML = '';
-  
-  function l(msg, c='info') { addFFmpegLog(msg, c); }
-  
+  const log = document.getElementById("ffmpegLog");
+  const el = document.getElementById("ffmpegProgress");
+  el.classList.remove("hidden");
+  document.getElementById("videoResult").classList.add("hidden");
+  log.innerHTML = "";
+  const l = (msg, c="info") => { log.innerHTML += `<div class="${c}">${msg}</div>`; };
   const c = getCurrentCase();
-  if (generatedFrames.length === 0) { l('❌ 没有画面文件', 'err'); return; }
-  
-  l('🔄 请求屏幕共享...');
-  document.getElementById('ffmpegText').textContent = '请求屏幕共享...';
-  
+  if (generatedFrames.length === 0) { l("没有画面文件", "err"); return; }
+  l("请求屏幕共享...");
+  document.getElementById("ffmpegText").textContent = "请求屏幕共享...";
   try {
     const displayStream = await navigator.mediaDevices.getDisplayMedia({
       video: { width: 540, height: 960 },
       audio: { echoCancellation: false, noiseSuppression: false }
     });
-    
     const audioTracks = displayStream.getAudioTracks();
-    l(`✅ 已获取: 视频1 + 音频${audioTracks.length}`, 'ok');
-    if (audioTracks.length === 0) l('⚠️ 确保勾选
-
-function downloadVideo() {
+    l("已获取: 视频1 + 音频" + audioTracks.length, "ok");
+    if (audioTracks.length === 0) l("未捕获到音频(需勾选分享音频)", "err");
+    const images = [];
+    for (let i = 0; i < generatedFrames.length; i++) {
+      const img = new Image();
+      await new Promise((r, rej) => { img.onload = r; img.onerror = rej; img.src = generatedFrames[i].url; });
+      images.push(img);
+    }
+    const chunks = [];
+    const recorder = new MediaRecorder(displayStream, { mimeType: "video/webm" });
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    const offCanvas = document.createElement("canvas");
+    offCanvas.width = 540; offCanvas.height = 960;
+    const offCtx = offCanvas.getContext("2d");
+    const totalDur = Math.max(c.scenes.reduce((s,x)=>s+x.dur,0), generatedAudio?.duration||0);
+    recorder.start(100);
+    l("开始录制...", "ok");
+    document.getElementById("ffmpegText").textContent = "录制中 0%";
+    const startTime = Date.now();
+    let prevScene = -1;
+    function renderFrame() {
+      const elapsed = (Date.now() - startTime) / 1000;
+      const pct = Math.min(elapsed/totalDur*100, 100);
+      document.getElementById("ffmpegFill").style.width = pct + "%";
+      document.getElementById("ffmpegText").textContent = "录制中 " + Math.floor(pct) + "%";
+      let acc = 0;
+      let curScene = c.scenes.length - 1;
+      for (let i = 0; i < c.scenes.length; i++) {
+        acc += c.scenes[i].dur;
+        if (elapsed < acc) { curScene = i; break; }
+      }
+      if (curScene !== prevScene && images[curScene]) {
+        prevScene = curScene;
+        offCtx.drawImage(images[curScene], 0, 0, 540, 960);
+        const preview = document.getElementById("vc");
+        if (preview) preview.getContext("2d").drawImage(offCanvas, 0, 0);
+      }
+      if (elapsed >= totalDur + 0.5) { recorder.stop(); return; }
+      requestAnimationFrame(renderFrame);
+    }
+    recorder.onstop = () => {
+      displayStream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(chunks, { type: "video/webm" });
+      finalVideoBlob = blob;
+      document.getElementById("ffmpegFill").style.width = "100%";
+      document.getElementById("ffmpegText").textContent = "完成! " + (blob.size/1024/1024).toFixed(1) + "MB";
+      document.getElementById("videoResult").classList.remove("hidden");
+      document.getElementById("finalVideo").src = URL.createObjectURL(blob);
+      document.getElementById("videoInfo").textContent = (blob.size/1024/1024).toFixed(1) + "MB | WebM";
+      l("视频已生成!", "ok");
+    };
+    renderFrame();
+  } catch(e) {
+    l("失败: " + (e.name==="NotAllowedError"?"用户取消":e.message), "err");
+    document.getElementById("ffmpegText").textContent = "录制失败";
+  }
+}function downloadVideo() {
   if (!finalVideoBlob) return toast('请先生成视频');
   const c = getCurrentCase();
   const a = document.createElement('a');
